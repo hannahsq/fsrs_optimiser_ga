@@ -1,0 +1,29 @@
+{
+    "git.ignoreLimitWarning": true,
+    "python.autoComplete.extraPaths": [
+        ".venv/lib/python3.1?/site-packages/pandas",
+        ".venv/lib/python3.1?/site-packages/deap",
+        ".venv/lib/python3.1?/site-packages/numpy",
+        ".venv/lib/python3.1?/site-packages/torch",
+        ".venv/lib/python3.1?/site-packages/scikit-learn",
+        ".venv/lib64/python3.1?/site-packages/pandas",
+        ".venv/lib64/python3.1?/site-packages/deap",
+        ".venv/lib64/python3.1?/site-packages/numpy",
+        ".venv/lib64/python3.1?/site-packages/torch",
+        ".venv/lib64/python3.1?/site-packages/scikit-learn",
+        ".venv/src/fsrs-optimizer",
+    ],
+    "python.analysis.extraPaths": [
+        ".venv/lib/python3.1?/site-packages/pandas",
+        ".venv/lib/python3.1?/site-packages/deap",
+        ".venv/lib/python3.1?/site-packages/numpy",
+        ".venv/lib/python3.1?/site-packages/torch",
+        ".venv/lib/python3.1?/site-packages/scikit-learn",
+        ".venv/lib64/python3.1?/site-packages/pandas",
+        ".venv/lib64/python3.1?/site-packages/deap",
+        ".venv/lib64/python3.1?/site-packages/numpy",
+        ".venv/lib64/python3.1?/site-packages/torch",
+        ".venv/lib64/python3.1?/site-packages/scikit-learn",
+        ".venv/src/fsrs-optimizer",
+    ]
+}
