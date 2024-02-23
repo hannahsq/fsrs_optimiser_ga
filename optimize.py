@@ -27,14 +27,13 @@ from fsrs_optimizer import (
     power_forgetting_curve,
     lineToTensor as line_to_tensor
 )
-from typing import Literal
 import torch
 from torch import Tensor
 from torch.nn import BCELoss
 from pathlib import Path
 from collections import deque
 from collections.abc import Callable
-from multiprocessing import Event, Pipe, Process, Lock
+from multiprocessing import Pipe, Process
 from multiprocessing.connection import Connection
 from typing import NamedTuple, Optional
 from deap.base import Fitness
@@ -46,8 +45,8 @@ from sklearn.metrics import root_mean_squared_error
 import pickle
 from operator import attrgetter
 from io import StringIO
-import timeit
 from datetime import datetime
+import lzma
 # from typing import TYPE_CHECKING
 # if TYPE_CHECKING:
 #     from _typeshed import SupportsAdd
@@ -159,7 +158,7 @@ class AnkiSample:
     def errors(self) -> list[float]:
         return self._errors
     
-    def calc_dsr(self) -> None:
+    def calc_DSR(self) -> None:
         model = FSRS(w=self.ind.weights)
         model.eval()
         # _model: torch.jit.ScriptModule = torch.jit.optimize_for_inference(torch.jit.script(model))
@@ -169,8 +168,8 @@ class AnkiSample:
             outputs: Tensor
             stabilities: Tensor
             difficulties: Tensor
-            # outputs, _ = _model(self._dataset.x_train.transpose(0, 1))
-            outputs = _model(self._dataset.x_train.transpose(0, 1))
+            outputs, _ = _model(self._dataset.x_train.transpose(0, 1))
+            # outputs = _model(self._dataset.x_train.transpose(0, 1))
             stabilities, difficulties = outputs[
                 self._dataset.seq_len - 1, torch.arange(end=len(self._dataset))
             ].transpose(0, 1)
@@ -180,9 +179,6 @@ class AnkiSample:
             t=self.df['delta_t'].values,
             s=self.df['stability'].values
         )
-    
-    def calc_DSR(self) -> None:
-        self.calc_dsr()
     
     @classmethod
     def calc_logloss(cls, df: DataFrame) -> float:
@@ -298,6 +294,7 @@ class GADemeConfig(NamedTuple):
 
 class GADeme(list):
     _pickle_path: Path = Path('selector.pickle')
+    _pickle_archive_path: Path = Path('selector.pickle.xz')
     _n_obj: int = len(GAIndividual.obj_weights)
     _cx_fn = partial(
         tools.cxSimulatedBinaryBounded,
@@ -329,7 +326,10 @@ class GADeme(list):
         self._last_migrated = 0
         self._print_fn = print_fn
         if not hasattr(GADeme, '_selector'):
-            if GADeme._pickle_path.exists():
+            if GADeme._pickle_archive_path.exists():
+                with lzma.open(GADeme._pickle_archive_path, mode='rb') as pickle_file:
+                    GADeme._selector: tools.selNSGA3WithMemory = pickle.load(file=pickle_file)
+            elif GADeme._pickle_path.exists():
                 with GADeme._pickle_path.open(mode='rb') as pickle_file:
                     GADeme._selector: tools.selNSGA3WithMemory = pickle.load(file=pickle_file)
             else:
