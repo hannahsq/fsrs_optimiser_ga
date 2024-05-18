@@ -1,17 +1,15 @@
-#    This file is part of DEAP.
-#
-#    DEAP is free software: you can redistribute it and/or modify
+#    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU Lesser General Public License as
-#    published by the Free Software Foundation, either version 3 of
+#    published by the Free Software Foundation, either version 2.1 of
 #    the License, or (at your option) any later version.
 #
-#    DEAP is distributed in the hope that it will be useful,
+#    This program is distributed in the hope that it will be useful,
 #    but WITHOUT ANY WARRANTY; without even the implied warranty of
 #    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 #    GNU Lesser General Public License for more details.
 #
 #    You should have received a copy of the GNU Lesser General Public
-#    License along with DEAP. If not, see <http://www.gnu.org/licenses/>.
+#    License along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 import copy
 import random
@@ -22,10 +20,11 @@ import pandas as pd
 from pandas import DataFrame, Series
 from fsrs_optimizer import (
     Optimizer,
-    RevlogDataset,
+    BatchDataset,
     FSRS,
     power_forgetting_curve,
-    lineToTensor as line_to_tensor
+    lineToTensor as line_to_tensor,
+    rmse_matrix
 )
 import torch
 from torch import Tensor
@@ -35,11 +34,11 @@ from collections import deque
 from collections.abc import Callable
 from multiprocessing import Pipe, Process
 from multiprocessing.connection import Connection
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, TextIO
 from deap.base import Fitness
 from deap import tools
 from pymoo.util.ref_dirs import get_reference_directions
-from functools import partial
+from functools import partial, cache
 from statsmodels.nonparametric.smoothers_lowess import lowess
 from sklearn.metrics import root_mean_squared_error
 import pickle
@@ -54,6 +53,7 @@ import lzma
 torch.autograd.set_detect_anomaly(mode=False, check_nan=False)
 torch.autograd.profiler.profile(enabled=False)
 
+@cache
 def clamp(x: int|float, range: tuple[int|float,int|float]) -> int|float:
     return min(max(x, range[0]), range[1])
 
@@ -77,9 +77,11 @@ class GAFitness(Fitness):
 
 class GAIndividual:
 
-    lb: list[float] = [0., 1.8, 4., 10., 1., 0.1, 0.1, 0., 0., 0.1, 0.01, 0.5, 0.01, 0.01, 0.01, 0., 1.]
-    ub: list[float] = [2., 8., 16., 32., 10., 5., 5., 0.5, 3., 0.8, 2.5, 5., 0.2, 0.9, 2., 1., 4.]
-    obj_weights: list[float] = [-1.0, -0.5, -0.125, -0.5, -0.125] * 3 + [-1.0]
+    lb: list[float] = [0., 1.8,  4., 10.,  1., 0.1, 0.1, 0.00, 0., 0.0, 0.01, 0.5, 0.01, 0.01, 0.01, 0., 1.]
+    ub: list[float] = [2., 8.0, 16., 60., 10., 5.0, 5.0, 0.75, 4., 0.8, 3.00, 5.0, 0.20, 0.90, 3.00, 1., 6.]
+
+    # obj_weights: list[float] = [-1.0, -0.5, -0.125, -0.5, -0.125] * 3 + [-1.0]
+    obj_weights: list[float] = [-0.5, -1.0, -1.0]
 
     def __init__(self, lb: list[float]=lb, ub: list[float] = ub) -> None:
         self.weights = [random.uniform(a=a, b=b) for a, b in zip(lb, ub)]
@@ -125,14 +127,17 @@ class GAIndividual:
 
 class AnkiSample:
     _bceloss = BCELoss(reduction='none')
+    DECAY = -0.5
+    FACTOR = 0.9 ** (1 / DECAY) - 1
 
     def __init__(self, df: DataFrame) -> None:
         self.df = df
-        self._dataset = RevlogDataset(dataframe=self.df)
+        self._dataset = BatchDataset(dataframe=self.df)
         self._metric_fns: list[Callable[[DataFrame], float]] = [
-            self.calc_logloss,
-            self.calc_rmse_bins,
-            self.calc_ici
+            # self.calc_logloss,
+            self.calc_rmse_matrix,
+            # self.calc_rmse_bins,
+            self.calc_ici,
         ]
     
     @property
@@ -157,8 +162,15 @@ class AnkiSample:
     @property
     def errors(self) -> list[float]:
         return self._errors
-    
+
     def calc_DSR(self) -> None:
+        def fast_calc_p(t, s):
+            @cache
+            def calc_p(t_s):
+                return (1 + AnkiSample.FACTOR * t_s[0] / t_s[1]) ** AnkiSample.DECAY
+
+            return np.array(map(calc_p, zip(t, s)))
+    
         model = FSRS(w=self.ind.weights)
         model.eval()
         # _model: torch.jit.ScriptModule = torch.jit.optimize_for_inference(torch.jit.script(model))
@@ -175,7 +187,7 @@ class AnkiSample:
             ].transpose(0, 1)
         self.df['stability'] = stabilities.tolist()
         self.df['difficulty'] = difficulties.tolist()
-        self.df['retention'] = power_forgetting_curve(
+        self.df['p'] = fast_calc_p(
             t=self.df['delta_t'].values,
             s=self.df['stability'].values
         )
@@ -183,7 +195,7 @@ class AnkiSample:
     @classmethod
     def calc_logloss(cls, df: DataFrame) -> float:
         review_losses: list[float] = cls._bceloss.forward(
-            input=ser_to_tensor(df['retention']), 
+            input=ser_to_tensor(df['p']), 
             target=ser_to_tensor(df['y'])
         ).tolist()
         # print(review_losses)
@@ -191,7 +203,7 @@ class AnkiSample:
 
     @classmethod
     def calc_ici(cls, df: DataFrame) -> float:
-        retention = df['retention'].values
+        retention = df['p'].values
         retention_calibrated: npTyping.ArrayLike = lowess(
             endog=df['y'].values,
             exog=retention,
@@ -199,32 +211,77 @@ class AnkiSample:
             delta=0.01 * (max(retention) - min(retention)),
             return_sorted=False
         )
-        return float(np.median(np.abs(retention_calibrated - retention)))
+        abs_err = np.abs(retention_calibrated - retention)
+        # percentiles = np.percentile(abs_err, [0.5, 0.7, 0.9, 0.99], method="median_unbiased")
+
+
+        # return float(np.mean(percentiles + [np.mean(abs_err)]))
+        return float(np.mean(abs_err))
 
     def bin_data(self):
         def get_bin(x: float) -> int:
             return int(x*100)
+        
+        @cache
+        def get_bin_2(x: float):
+            return (
+                np.log(np.minimum(np.floor(np.exp(np.log(40 + 1) * x) - 1), 40 - 1) + 1)
+                / np.log(40)
+            ).round(3)
+        
+        def get_bin_cached(x: float):
+            return get_bin_2(round(x, 3))
 
-        self.df["bin"] = self.df["retention"].map(get_bin)
+        @cache
+        def get_count(x):
+            return x.count("1")
+
+        @cache
+        def get_expensive_bin_nonzero(x, logn, scale, dig):
+            x = round(x, 3)
+            return round(scale * np.power(logn, np.floor(np.log(x) / np.log(logn))), dig)
+
+        @cache
+        def get_expensive_bin(x, logn, scale, dig):
+            return get_expensive_bin_nonzero(x, logn, scale, dig) if x != 0 else 0
+
+        self.df["bin"] = self.df['p'].map(get_bin_cached)
+        self.df["lapse"] = self.df["r_history"].map(get_count)
+        self.df["dt_bin"] = self.df["delta_t"].map(partial(get_expensive_bin_nonzero, logn=3.62, scale=2.48, dig=2))
+        self.df["i_bin"] = self.df["i"].map(partial(get_expensive_bin_nonzero, logn=1.89, scale=1.99, dig=0))
+        self.df["lapse_bin"] = self.df["lapse"].map(partial(get_expensive_bin, logn=1.73, scale=1.65, dig=0))
     
     @classmethod
-    # @numba.jit
     def calc_rmse_bins(cls, df: DataFrame) -> float:
-        df = df.groupby(by='bin').agg({"y": ["mean"], "retention": ["mean", "count"]})
+        df = df.groupby(by='bin').agg({"y": ["mean"], 'p': ["mean", "count"]})
         return root_mean_squared_error(
             y_true=df[("y", "mean")],
-            y_pred=df[("retention", "mean")],
-            sample_weight=df[("retention", "count")]
+            y_pred=df[('p', "mean")],
+            sample_weight=df[('p', "count")]
         )
+
+    @classmethod
+    def calc_rmse_matrix(cls, df: DataFrame) -> float:
+        tmp = (
+            df.groupby(["dt_bin", "i_bin", "lapse_bin", "bin"])
+            .agg({"y": "mean", "p": "mean", "card_id": "count"})
+            .reset_index()
+        )
+        # tmp = (df.pivot_table(columns=["dt_bin", "i_bin", "lapse_bin"], aggfunc={"y": "mean", "p": "mean", "card_id": "count"}).transpose().reset_index())
+        # print(df, "\n", tmp_old, "\n", tmp)
+        return root_mean_squared_error(tmp["y"], tmp["p"], sample_weight=tmp["card_id"])
 
     def calculate_metrics(self) -> None:
         pop_error: list[float] = [metric_fn(self.df) for metric_fn in self._metric_fns]
-        temp = self.df.drop(self.df[(self.df["i"] <= 2)].index)
-        groups = temp.groupby(by=temp["r_history"].str[-1])
-        ratings_errors: list[list[float]] = [[metric_fn(group) for metric_fn in self._metric_fns] for _, group in groups]
-        errors: list[float] = [elem for row in zip(*([pop_error] + ratings_errors)) for elem in row]
-        temp = list(np.subtract(errors[:5], 0.21)) + list(np.add(errors[5:10], 0.194)) + list(np.add(errors[10:], 0.2))
-        self._errors: list[float] = errors + [float(np.prod(temp)**(1/(len(temp)))-0.2)]
+        # pop_error = [(pop_error[0] - 0.38)*10] + pop_error[1:-1] + [pop_error[-1] * 30]
+        # temp = self.df.drop(self.df[(self.df["i"] <= 2)].index)
+        # groups = temp.groupby(by=temp["r_history"].str[-1])
+        # ratings_errors: list[list[float]] = [[metric_fn(group) for metric_fn in self._metric_fns] for _, group in groups]
+        # errors: list[float] = [elem for row in zip(*([pop_error] + ratings_errors)) for elem in row]
+        # temp = list(np.subtract(errors[:5], 0.21)) + list(np.add(errors[5:10], 0.194)) + list(np.add(errors[10:], 0.2))
+        # self._errors: list[float] = errors + [float(np.prod(temp)**(1/(len(temp)))-0.2)]
+        # self._errors: list[float] = pop_error + [sum(pop_error)]
+        self._errors: list[float] = pop_error + [sum(pop_error)]
 
 
 class AnkiSampler:
@@ -293,9 +350,9 @@ class GADemeConfig(NamedTuple):
     # crossover_fn: Callable[[GAPopulation], GAPopulation]
 
 class GADeme(list):
-    _pickle_path: Path = Path('selector.pickle')
-    _pickle_archive_path: Path = Path('selector.pickle.xz')
     _n_obj: int = len(GAIndividual.obj_weights)
+    _pickle_path: Path = Path(f'selector_{_n_obj}.pickle')
+    _pickle_archive_path: Path = Path(f'selector_{_n_obj}.pickle.xz')
     _cx_fn = partial(
         tools.cxSimulatedBinaryBounded,
         low=GAIndividual.lb,
@@ -316,7 +373,8 @@ class GADeme(list):
             pipein: Connection,
             pipeout: Connection,
             sampler: AnkiSampler,
-            print_fn: Callable
+            print_fn: Callable,
+            dump_file: TextIO
         ) -> None:
         self.config: GADemeConfig = config
         self.population: list[GAIndividual] = self._gen_seed_population(n_pop=self.config.n_pop)
@@ -325,6 +383,7 @@ class GADeme(list):
         self.pipe_out = pipeout
         self._last_migrated = 0
         self._print_fn = print_fn
+        self._dump_file=dump_file
         if not hasattr(GADeme, '_selector'):
             if GADeme._pickle_archive_path.exists():
                 with lzma.open(GADeme._pickle_archive_path, mode='rb') as pickle_file:
@@ -332,11 +391,14 @@ class GADeme(list):
             elif GADeme._pickle_path.exists():
                 with GADeme._pickle_path.open(mode='rb') as pickle_file:
                     GADeme._selector: tools.selNSGA3WithMemory = pickle.load(file=pickle_file)
+                if not GADeme._pickle_archive_path.exists():
+                    with lzma.open(GADeme._pickle_archive_path, mode='wb') as pickle_file:
+                        pickle.dump(obj=GADeme._selector, file=pickle_file, protocol=pickle.HIGHEST_PROTOCOL)
             else:
                 GADeme._selector = tools.selNSGA3WithMemory(
                     ref_points=get_reference_directions('layer-energy', GADeme._n_obj, [3,2,1,1,0])
                 )
-                with GADeme._pickle_path.open(mode='wb') as pickle_file:
+                with lzma.open(GADeme._pickle_archive_path, mode='wb', preset= 9 | lzma.PRESET_EXTREME) as pickle_file:
                     pickle.dump(obj=GADeme._selector, file=pickle_file, protocol=pickle.HIGHEST_PROTOCOL)
 
     def _print_gen_stats(self, generation: int) -> None:
@@ -370,6 +432,11 @@ class GADeme(list):
         fit_stats, fit_stats_strs = format_gen_stats('fitness.values')
         pop_stats, pop_stats_strs = format_gen_stats('weights')
 
+        best_idxs = [self.population[idx].weights for idx in next(zip(*fit_stats[0]))]
+
+        pop_list = [" ".join(["{:9.5g}".format(weight) for weight in list(pop.weights) + list(pop.fitness.values)]) + '\n' for pop in sorted(self.population, key=lambda x:x.fitness.values[-1])]
+        self._dump_file.writelines(pop_list)
+
         stats_str = "\n".join([
             f"Worker {self.config.worker_id}: Generation: {generation}, Timestamp: {datetime.now().astimezone().isoformat()}",
             "Fitness Stats:",
@@ -380,7 +447,7 @@ class GADeme(list):
         self._print_fn(stats_str)
 
         if generation >= self.config.n_gen - 1:
-            with Path(f"deme_{self.config.worker_id}.pickle").open('wb') as pickle_file:
+            with Path(f"dumps/deme_{self.config.worker_id}.pickle").open('wb') as pickle_file:
                 pickle.dump(self.population, pickle_file, protocol=pickle.HIGHEST_PROTOCOL)
 
     def evaluate(self) -> None:
@@ -441,7 +508,7 @@ class GADeme(list):
         return False
 
     def begin_evolution(self) -> None:
-        self._sampler.resample(frac=0.7)
+        self._sampler.resample(frac=1)
         for i in range(self.config.n_gen):
             stop: bool = self.generation()
             self._print_gen_stats(generation=i)
@@ -500,16 +567,16 @@ def worker_proc(
 
     deme_config = GADemeConfig(
         worker_id = procid,
-        n_pop = 20,
+        n_pop = 200,
         n_gen = n_gen,
-        n_mig = 5,
+        n_mig = 40,
         cx_prob = 1.0,
-        mx_prob = 0.05,
+        mx_prob = 0.1,
         mig_freq = 5
     )
-    deme = GADeme(config=deme_config, pipein=pipein, pipeout=pipeout, sampler=sampler, print_fn=print_to_stats_proc)
-    
-    deme.begin_evolution()
+    with Path(f"dumps/pop_dump_{procid}.txt").open('w') as dump_file:
+        deme = GADeme(config=deme_config, pipein=pipein, pipeout=pipeout, sampler=sampler, print_fn=print_to_stats_proc, dump_file=dump_file)
+        deme.begin_evolution()
     # pr.disable()
 
     # pr.dump_stats(f"worker_{procid}.bin")
@@ -523,8 +590,8 @@ def stats_proc(pipes_in, n_gen) -> None:
 if __name__ == "__main__":
     random.seed(64)
     
-    NUM_DEMES = 4
-    NUM_GENERATIONS = 20
+    NUM_DEMES = 5
+    NUM_GENERATIONS = 400
     
     w2w_pipes: list[tuple[Connection, Connection]] = [Pipe(duplex=False) for _ in range(NUM_DEMES)]
     w2w_pipes_in = deque(iterable=(p[0] for p in w2w_pipes))
@@ -559,6 +626,7 @@ if __name__ == "__main__":
     # sortby = SortKey.CUMULATIVE
     # bin_files = [f"worker_{i}.bin" for i in range(NUM_DEMES)]
     # ps = pstats.Stats(*bin_files, stream=s).strip_dirs().sort_stats(sortby)
-    # ps.print_stats(0.1)
+    # # ps.print_stats(0.1)
     # # ps.print_callers(".*evaluate.*")
+    # ps.print_callees(".*rmse_.*")
     # print(s.getvalue())

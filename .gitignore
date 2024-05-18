@@ -213,3 +213,7 @@ images/
 
 # Binaries
 *.bin
+
+dumps/
+*temp*
+*~lock*
